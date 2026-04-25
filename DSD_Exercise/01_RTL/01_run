@@ -1,0 +1,5 @@
+vcs ../00_TB/testfixture1.v GSIM.v -full64 -R -debug_access+all +v2k
+vcs ../00_TB/testfixture2.v GSIM.v -full64 -R -debug_access+all +v2k
+vcs ../00_TB/testfixture3.v GSIM.v -full64 -R -debug_access+all +v2k
+vcs ../00_TB/testfixture4.v GSIM.v -full64 -R -debug_access+all +v2k
+vcs ../00_TB/testfixture5.v GSIM.v -full64 -R -debug_access+all +v2k

@@ -1,0 +1,27 @@
+set company {NTUGIEE}
+set designer {Student}
+
+set search_path    "/share1/tech/ADFP/Executable_Package/Collaterals/IP/stdcell/N16ADFP_StdCell/CCS/ \
+                    $search_path .\
+                    "
+
+set target_library "N16ADFP_StdCellff0p88v125c_ccs.db \
+                    N16ADFP_StdCellff0p88vm40c_ccs.db \
+                    N16ADFP_StdCellss0p72v125c_ccs.db \
+                    N16ADFP_StdCellss0p72vm40c_ccs.db \
+                    N16ADFP_StdCelltt0p8v25c_ccs.db \
+                    "
+                    
+set link_library "* $target_library dw_foundation.sldb"
+set symbol_library "generic.sdb"
+set synthetic_library "dw_foundation.sldb"
+
+
+set default_schematic_options {-size infinite}
+
+set hdlin_translate_off_skip_text "TRUE"
+set edifout_netlist_only "TRUE"
+set verilogout_no_tri true
+
+
+
