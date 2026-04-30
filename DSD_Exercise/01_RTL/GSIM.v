@@ -21,6 +21,40 @@ reg [3:0] out_idx;
 reg [3:0] b_idx;
 reg signed [15:0] b_mem [0:15];
 
+// ---- debug taps: expose b_mem as normal wires (Verilog-2001 friendly) ----
+wire signed [15:0] b_mem0_dbg;
+wire signed [15:0] b_mem1_dbg;
+wire signed [15:0] b_mem2_dbg;
+wire signed [15:0] b_mem3_dbg;
+wire signed [15:0] b_mem4_dbg;
+wire signed [15:0] b_mem5_dbg;
+wire signed [15:0] b_mem6_dbg;
+wire signed [15:0] b_mem7_dbg;
+wire signed [15:0] b_mem8_dbg;
+wire signed [15:0] b_mem9_dbg;
+wire signed [15:0] b_mem10_dbg;
+wire signed [15:0] b_mem11_dbg;
+wire signed [15:0] b_mem12_dbg;
+wire signed [15:0] b_mem13_dbg;
+wire signed [15:0] b_mem14_dbg;
+wire signed [15:0] b_mem15_dbg;
+assign b_mem0_dbg  = b_mem[0];
+assign b_mem1_dbg  = b_mem[1];
+assign b_mem2_dbg  = b_mem[2];
+assign b_mem3_dbg  = b_mem[3];
+assign b_mem4_dbg  = b_mem[4];
+assign b_mem5_dbg  = b_mem[5];
+assign b_mem6_dbg  = b_mem[6];
+assign b_mem7_dbg  = b_mem[7];
+assign b_mem8_dbg  = b_mem[8];
+assign b_mem9_dbg  = b_mem[9];
+assign b_mem10_dbg = b_mem[10];
+assign b_mem11_dbg = b_mem[11];
+assign b_mem12_dbg = b_mem[12];
+assign b_mem13_dbg = b_mem[13];
+assign b_mem14_dbg = b_mem[14];
+assign b_mem15_dbg = b_mem[15];
+
 // ---- iter_ctrl integration ----
 // IMPORTANT: `iter_ctrl` samples `start` on posedge. If we generate `iter_start`
 // with a reg assigned in this same always block, it can be missed (NBA update).
@@ -101,12 +135,20 @@ always @(posedge clk or posedge reset) begin
             x_out <= 32'd0;
             out_idx <= 4'd0;
             b_idx <= 4'd0;
+            // ← 加這段：IDLE→READ_B 轉移的同一個 posedge 就捕 b[0]
+            if(in_en)begin
+              b_mem[0] <= b_in;
+              b_idx <= 4'd1; //下一個 READ_B cycle從 idx=1開始
+            end
         end
         READ_B: begin
             out_valid <= 1'b0;
-            b_mem[b_idx] <= b_in;
-            x_reg <= b_in;
-            if (b_idx != 4'd15) b_idx <= b_idx + 4'd1;
+            
+            if (in_en || (b_idx == 4'd15)) begin
+                b_mem[b_idx] <= b_in;
+                x_reg <= b_in;
+                if (b_idx != 4'd15) b_idx <= b_idx + 4'd1;
+            end
         end
         INIT_X: begin
             out_valid <= 1'b0;
@@ -181,9 +223,9 @@ module core_xi (
   reg signed [47:0] term_m6_r;
   reg signed [47:0] term_p1_r;
   reg signed [47:0] numer_r;
-
+  reg signed [47:0] bi_q16_r;
   // Sign-extend to wider bitwidth for safe shift-add and accumulation.
-  wire signed [47:0] bi_q16  = {{32{bi[15]}},  bi}  <<< 16; // int -> Q16.16 in 48b
+  //wire signed [47:0] bi_q16  = {{32{bi[15]}},  bi}  <<< 16; // int -> Q16.16 in 48b
   wire signed [47:0] xim3_48 = {{16{x_im3[31]}}, x_im3};
   wire signed [47:0] xim2_48 = {{16{x_im2[31]}}, x_im2};
   wire signed [47:0] xim1_48 = {{16{x_im1[31]}}, x_im1};
@@ -206,17 +248,19 @@ module core_xi (
   // Truncates toward zero (Verilog signed division behavior).
   wire signed [47:0] wire_div20 = numer_r / 48'sd20;
 
+//pipeline
   always @(posedge clk or posedge reset) begin
     if (reset) begin
       v1 <= 1'b0;
       v2 <= 1'b0;
       v3 <= 1'b0;
-      term_p13_r <= 48'sd0;
-      term_m6_r  <= 48'sd0;
-      term_p1_r  <= 48'sd0;
-      numer_r    <= 48'sd0;
-      x_out <= 32'sd0;
+      term_p13_r <= 48'd0;
+      term_m6_r  <= 48'd0;
+      term_p1_r  <= 48'd0;
+      numer_r    <= 48'd0;
+      x_out <= 32'd0;
       out_valid <= 1'b0;
+      bi_q16_r <= 48'd0;
     end else begin
       // valid pipeline
       v3 <= v2;
@@ -225,6 +269,7 @@ module core_xi (
 
       // stage1: capture constant-mult terms
       if (in_valid) begin
+        bi_q16_r <= bi_q16;
         term_p13_r <= wire_term_p13;
         term_m6_r  <= wire_term_m6;
         term_p1_r  <= wire_term_p1;
@@ -296,22 +341,22 @@ module iter_ctrl #(
   // ---- Initial guess x^(0) (Q16.16) ----
   // Edit the assigns below to set each x[i] initial value.
   wire signed [31:0] x_init [0:15];
-  assign x_init[0]  = 32'sd0;
-  assign x_init[1]  = 32'sd0;
-  assign x_init[2]  = 32'sd0;
-  assign x_init[3]  = 32'sd0;
-  assign x_init[4]  = 32'sd0;
-  assign x_init[5]  = 32'sd0;
-  assign x_init[6]  = 32'sd0;
-  assign x_init[7]  = 32'sd0;
-  assign x_init[8]  = 32'sd0;
-  assign x_init[9]  = 32'sd0;
-  assign x_init[10] = 32'sd0;
-  assign x_init[11] = 32'sd0;
-  assign x_init[12] = 32'sd0;
-  assign x_init[13] = 32'sd0;
-  assign x_init[14] = 32'sd0;
-  assign x_init[15] = 32'sd0;
+  assign x_init[0]  = 32'd0;
+  assign x_init[1]  = 32'd0;
+  assign x_init[2]  = 32'd0;
+  assign x_init[3]  = 32'd0;
+  assign x_init[4]  = 32'd0;
+  assign x_init[5]  = 32'd0;
+  assign x_init[6]  = 32'd0;
+  assign x_init[7]  = 32'd0;
+  assign x_init[8]  = 32'd0;
+  assign x_init[9]  = 32'd0;
+  assign x_init[10] = 32'd0;
+  assign x_init[11] = 32'd0;
+  assign x_init[12] = 32'd0;
+  assign x_init[13] = 32'd0;
+  assign x_init[14] = 32'd0;
+  assign x_init[15] = 32'd0;
 
   // ---- Internal storage ----
   reg signed [31:0] x_old [0:15];
@@ -371,18 +416,27 @@ module iter_ctrl #(
   reg [1:0] bubble_cnt;
 
   // Launch decision for this cycle (must be stable BEFORE posedge).
-  wire [3:0] next_idx = group + (slot << 2);
+  //wire [3:0] next_idx = group + (slot << 2);
+  wire [3:0] next_idx = {slot, group};
   wire       launch   = (state == RUN) && (bubble_cnt == 2'd0) && (issued_cnt < 5'd16);
 
   // Drive core inputs from the idx being launched this cycle.
-  wire signed [15:0] bi_cur = pick_b(next_idx);
+  /*wire signed [15:0] bi_cur = pick_b(next_idx);
   wire signed [31:0] xim3 = pick_x($signed({1'b0,next_idx}) - 3);
   wire signed [31:0] xim2 = pick_x($signed({1'b0,next_idx}) - 2);
   wire signed [31:0] xim1 = pick_x($signed({1'b0,next_idx}) - 1);
   wire signed [31:0] xip1 = pick_x($signed({1'b0,next_idx}) + 1);
   wire signed [31:0] xip2 = pick_x($signed({1'b0,next_idx}) + 2);
-  wire signed [31:0] xip3 = pick_x($signed({1'b0,next_idx}) + 3);
-
+  wire signed [31:0] xip3 = pick_x($signed({1'b0,next_idx}) + 3);*/
+  wire signed [15:0] bi_cur = pick_b(next_idx);
+  // Verilog-2001 friendly index arithmetic (no SystemVerilog casts).
+  wire signed [5:0] next_idx_s = {2'b00, next_idx}; // 0..15 in signed 6b
+  wire signed [31:0] xim3 = pick_x(next_idx_s - 6'd3);
+  wire signed [31:0] xim2 = pick_x(next_idx_s - 6'd2);
+  wire signed [31:0] xim1 = pick_x(next_idx_s - 6'd1);
+  wire signed [31:0] xip1 = pick_x(next_idx_s + 6'd1);
+  wire signed [31:0] xip2 = pick_x(next_idx_s + 6'd2);
+  wire signed [31:0] xip3 = pick_x(next_idx_s + 6'd3);
   wire core_in_valid = launch;
   wire core_out_valid;
 
