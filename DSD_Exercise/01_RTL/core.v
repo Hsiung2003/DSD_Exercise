@@ -25,12 +25,12 @@ module core_xi (
   output reg signed [31:0] x_out
 );
 
-  reg [1:0] state;
-  reg signed [47:0] term_p13;
-  reg signed [47:0] term_m6;
-  reg signed [47:0] term_p1;
-  reg signed [47:0] numer;
-  // div20 register not needed; use wire_div20 directly in stage3
+  // True 3-stage pipeline (accepts new input every cycle)
+  reg v1, v2, v3;
+  reg signed [47:0] term_p13_r;
+  reg signed [47:0] term_m6_r;
+  reg signed [47:0] term_p1_r;
+  reg signed [47:0] numer_r;
 
   // Sign-extend to wider bitwidth for safe shift-add and accumulation.
   wire signed [47:0] bi_q16  = {{32{bi[15]}},  bi}  <<< 16; // int -> Q16.16 in 48b
@@ -50,51 +50,46 @@ module core_xi (
   wire signed [47:0] wire_term_m6  = -((wire_sum_m6  <<< 1) + (wire_sum_m6  <<< 2));        // *(-6)
   wire signed [47:0] wire_term_p1  = wire_sum_p1;
 
-  wire signed [47:0] wire_numer = bi_q16 + term_p13 + term_m6 + term_p1; // Q16.16
+  wire signed [47:0] wire_numer = bi_q16 + term_p13_r + term_m6_r + term_p1_r; // Q16.16
 
   // First version: exact constant divide by 20 (synthesizable in most flows).
   // Truncates toward zero (Verilog signed division behavior).
-  wire signed [47:0] wire_div20 = numer / 48'sd20;
+  wire signed [47:0] wire_div20 = numer_r / 48'sd20;
 
   always @(posedge clk or posedge reset) begin
     if (reset) begin
-      state <= 2'b00;
-      term_p13 <= 48'sd0;
-      term_m6  <= 48'sd0;
-      term_p1  <= 48'sd0;
-      numer    <= 48'sd0;
-      x_out <= 32'b0;
+      v1 <= 1'b0;
+      v2 <= 1'b0;
+      v3 <= 1'b0;
+      term_p13_r <= 48'sd0;
+      term_m6_r  <= 48'sd0;
+      term_p1_r  <= 48'sd0;
+      numer_r    <= 48'sd0;
+      x_out <= 32'sd0;
       out_valid <= 1'b0;
     end else begin
-      case (state)
-        2'b00: begin
-          out_valid <= 1'b0;
-          if (in_valid) begin
-            state <= 2'b01;
-            term_p13 <= wire_term_p13;
-            term_m6  <= wire_term_m6;
-            term_p1  <= wire_term_p1;
-          end else begin
-            state <= 2'b00;
-            term_p13 <= 48'sd0;
-            term_m6  <= 48'sd0;
-            term_p1  <= 48'sd0;
-          end
-        end
-        2'b01: begin
-          state <= 2'b10;
-          numer <= wire_numer;
-        end
-        2'b10: begin
-          state <= 2'b00;
-          x_out <= wire_div20[31:0];
-          out_valid <= 1'b1;
-        end
-        default: begin
-          state <= 2'b00;
-          out_valid <= 1'b0;
-        end
-      endcase
+      // valid pipeline
+      v3 <= v2;
+      v2 <= v1;
+      v1 <= in_valid;
+
+      // stage1: capture constant-mult terms
+      if (in_valid) begin
+        term_p13_r <= wire_term_p13;
+        term_m6_r  <= wire_term_m6;
+        term_p1_r  <= wire_term_p1;
+      end
+
+      // stage2: capture numerator
+      if (v1) begin
+        numer_r <= wire_numer;
+      end
+
+      // stage3: output
+      out_valid <= v2;
+      if (v2) begin
+        x_out <= wire_div20[31:0];
+      end
     end
   end
 

@@ -22,25 +22,17 @@ reg [3:0] b_idx;
 reg signed [15:0] b_mem [0:15];
 
 // ---- iter_ctrl integration ----
-reg iter_start;
+// IMPORTANT: `iter_ctrl` samples `start` on posedge. If we generate `iter_start`
+// with a reg assigned in this same always block, it can be missed (NBA update).
+// So generate a combinational pulse that is HIGH *before* the posedge where the
+// last b is latched.
+wire iter_start;
 wire iter_busy, iter_done;
 wire signed [31:0] x0, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15;
-assign x0 = 32'd0;
-assign x1 = 32'd0;
-assign x2 = 32'd0;
-assign x3 = 32'd0;
-assign x4 = 32'd0;
-assign x5 = 32'd0;
-assign x6 = 32'd0;
-assign x7 = 32'd0;
-assign x8 = 32'd0;
-assign x9 = 32'd0;
-assign x10 = 32'd0;
-assign x11 = 32'd0;
-assign x12 = 32'd0;
-assign x13 = 32'd0;
-assign x14 = 32'd0;
-assign x15 = 32'd0;
+
+// Robust start pulse: hold start HIGH for the whole INIT_X cycle so iter_ctrl
+// (which samples on posedge) will not miss it.
+assign iter_start = (state == INIT_X);
 
 iter_ctrl u_iter_ctrl (
     .clk(clk),
@@ -64,10 +56,13 @@ always @(*) begin
     case (state)
         IDLE: next_state = in_en ? READ_B : IDLE;
         READ_B: begin
-            if (!in_en) next_state = IDLE;
-            else next_state = (b_idx == 4'd15) ? INIT_X : READ_B;
+            // After the last b is captured (b_idx==15), advance to INIT_X even if
+            // host deasserts in_en immediately after sending the 16th sample.
+            if (b_idx == 4'd15) next_state = INIT_X;
+            else if (!in_en) next_state = IDLE;
+            else next_state = READ_B;
         end
-        INIT_X: next_state = ITERATE; // pulse iter_start for 1 cycle
+        INIT_X: next_state = ITERATE; // iter_start is generated in READ_B when b[15] is latched
         ITERATE: next_state = iter_done ? WRITE_OUT : ITERATE;
         WRITE_OUT: next_state = (out_idx == 4'd15) ? IDLE : WRITE_OUT;
         default: next_state = IDLE;
@@ -95,14 +90,11 @@ always @(posedge clk or posedge reset) begin
         b_idx <= 4'd0;
         out_valid <= 1'b0;
         x_out <= 32'd0;
-        iter_start <= 1'b0;
-
         for (i = 0; i < 16; i = i + 1) begin
             b_mem[i] <= 16'd0;
         end
     end 
     else begin
-        iter_start <= 1'b0; // default
         case(state)
         IDLE: begin
             out_valid <= 1'b0;
@@ -118,7 +110,6 @@ always @(posedge clk or posedge reset) begin
         end
         INIT_X: begin
             out_valid <= 1'b0;
-            iter_start <= 1'b1; // kick iter_ctrl
         end
         ITERATE: begin
             out_valid <= 1'b0;
@@ -184,11 +175,12 @@ module core_xi (
   output reg signed [31:0] x_out
 );
 
-  reg [1:0] state;
-  reg signed [47:0] term_p13;
-  reg signed [47:0] term_m6;
-  reg signed [47:0] term_p1;
-  reg signed [47:0] numer;
+  // True 3-stage pipeline (accepts a new input every cycle).
+  reg v1, v2, v3;
+  reg signed [47:0] term_p13_r;
+  reg signed [47:0] term_m6_r;
+  reg signed [47:0] term_p1_r;
+  reg signed [47:0] numer_r;
 
   // Sign-extend to wider bitwidth for safe shift-add and accumulation.
   wire signed [47:0] bi_q16  = {{32{bi[15]}},  bi}  <<< 16; // int -> Q16.16 in 48b
@@ -208,51 +200,46 @@ module core_xi (
   wire signed [47:0] wire_term_m6  = -((wire_sum_m6  <<< 1) + (wire_sum_m6  <<< 2));        // *(-6)
   wire signed [47:0] wire_term_p1  = wire_sum_p1;
 
-  wire signed [47:0] wire_numer = bi_q16 + term_p13 + term_m6 + term_p1; // Q16.16
+  wire signed [47:0] wire_numer = bi_q16 + term_p13_r + term_m6_r + term_p1_r; // Q16.16
 
   // Exact constant divide by 20 (synthesizable in most flows).
   // Truncates toward zero (Verilog signed division behavior).
-  wire signed [47:0] wire_div20 = numer / 48'sd20;
+  wire signed [47:0] wire_div20 = numer_r / 48'sd20;
 
   always @(posedge clk or posedge reset) begin
     if (reset) begin
-      state <= 2'b00;
-      term_p13 <= 48'sd0;
-      term_m6  <= 48'sd0;
-      term_p1  <= 48'sd0;
-      numer    <= 48'sd0;
-      x_out <= 32'b0;
+      v1 <= 1'b0;
+      v2 <= 1'b0;
+      v3 <= 1'b0;
+      term_p13_r <= 48'sd0;
+      term_m6_r  <= 48'sd0;
+      term_p1_r  <= 48'sd0;
+      numer_r    <= 48'sd0;
+      x_out <= 32'sd0;
       out_valid <= 1'b0;
     end else begin
-      case (state)
-        2'b00: begin
-          out_valid <= 1'b0;
-          if (in_valid) begin
-            state <= 2'b01;
-            term_p13 <= wire_term_p13;
-            term_m6  <= wire_term_m6;
-            term_p1  <= wire_term_p1;
-          end else begin
-            state <= 2'b00;
-            term_p13 <= 48'sd0;
-            term_m6  <= 48'sd0;
-            term_p1  <= 48'sd0;
-          end
-        end
-        2'b01: begin
-          state <= 2'b10;
-          numer <= wire_numer;
-        end
-        2'b10: begin
-          state <= 2'b00;
-          x_out <= wire_div20[31:0];
-          out_valid <= 1'b1;
-        end
-        default: begin
-          state <= 2'b00;
-          out_valid <= 1'b0;
-        end
-      endcase
+      // valid pipeline
+      v3 <= v2;
+      v2 <= v1;
+      v1 <= in_valid;
+
+      // stage1: capture constant-mult terms
+      if (in_valid) begin
+        term_p13_r <= wire_term_p13;
+        term_m6_r  <= wire_term_m6;
+        term_p1_r  <= wire_term_p1;
+      end
+
+      // stage2: capture numerator
+      if (v1) begin
+        numer_r <= wire_numer;
+      end
+
+      // stage3: output
+      out_valid <= v2;
+      if (v2) begin
+        x_out <= wire_div20[31:0];
+      end
     end
   end
 
@@ -377,23 +364,27 @@ module iter_ctrl #(
     end
   endfunction
 
-  // Neighbors for issued idx (combinational).
-  reg  [3:0] issue_idx_r;
-  wire signed [15:0] bi_cur = pick_b(issue_idx_r);
-  wire signed [31:0] xim3 = pick_x($signed({1'b0,issue_idx_r}) - 3);
-  wire signed [31:0] xim2 = pick_x($signed({1'b0,issue_idx_r}) - 2);
-  wire signed [31:0] xim1 = pick_x($signed({1'b0,issue_idx_r}) - 1);
-  wire signed [31:0] xip1 = pick_x($signed({1'b0,issue_idx_r}) + 1);
-  wire signed [31:0] xip2 = pick_x($signed({1'b0,issue_idx_r}) + 2);
-  wire signed [31:0] xip3 = pick_x($signed({1'b0,issue_idx_r}) + 3);
-  
-  reg core_in_valid;
-  wire core_out_valid;
+  // Pipeline/issue bookkeeping regs (declare before any wire uses them).
   reg [3:0] idx_pipe0, idx_pipe1, idx_pipe2;
   reg        v_pipe0, v_pipe1, v_pipe2;
   reg [4:0] issued_cnt, commit_cnt;
   reg [1:0] bubble_cnt;
+
+  // Launch decision for this cycle (must be stable BEFORE posedge).
   wire [3:0] next_idx = group + (slot << 2);
+  wire       launch   = (state == RUN) && (bubble_cnt == 2'd0) && (issued_cnt < 5'd16);
+
+  // Drive core inputs from the idx being launched this cycle.
+  wire signed [15:0] bi_cur = pick_b(next_idx);
+  wire signed [31:0] xim3 = pick_x($signed({1'b0,next_idx}) - 3);
+  wire signed [31:0] xim2 = pick_x($signed({1'b0,next_idx}) - 2);
+  wire signed [31:0] xim1 = pick_x($signed({1'b0,next_idx}) - 1);
+  wire signed [31:0] xip1 = pick_x($signed({1'b0,next_idx}) + 1);
+  wire signed [31:0] xip2 = pick_x($signed({1'b0,next_idx}) + 2);
+  wire signed [31:0] xip3 = pick_x($signed({1'b0,next_idx}) + 3);
+
+  wire core_in_valid = launch;
+  wire core_out_valid;
 
   wire signed [31:0] x_calc;
   core_xi u_core (
@@ -418,8 +409,8 @@ module iter_ctrl #(
       issued_cnt <= 5'd0;
       commit_cnt <= 5'd0;
       bubble_cnt <= 2'd0;
-      core_in_valid <= 1'b0;
-      issue_idx_r <= 4'd0;
+      v_pipe0 <= 1'b0; v_pipe1 <= 1'b0; v_pipe2 <= 1'b0;
+      idx_pipe0 <= 4'd0; idx_pipe1 <= 4'd0; idx_pipe2 <= 4'd0;
 
       busy <= 1'b0;
       done <= 1'b0;
@@ -439,16 +430,15 @@ module iter_ctrl #(
     end else begin
       // defaults
       done <= 1'b0;
-      core_in_valid <= 1'b0;
 
       // ---- pipeline bookkeeping: shift + conditional load ----
       v_pipe2   <= v_pipe1;
       idx_pipe2 <= idx_pipe1;
       v_pipe1   <= v_pipe0;
       idx_pipe1 <= idx_pipe0;
-      if (core_in_valid) begin
+      if (launch) begin
         v_pipe0   <= 1'b1;
-        idx_pipe0 <= issue_idx_r;
+        idx_pipe0 <= next_idx;
       end else begin
         v_pipe0   <= 1'b0;
       end
@@ -495,10 +485,8 @@ module iter_ctrl #(
           busy <= 1'b1;
           if (bubble_cnt != 2'd0) begin
             bubble_cnt <= bubble_cnt - 2'd1;
-          end else if (issued_cnt < 5'd16) begin // issue next
+          end else if (issued_cnt < 5'd16) begin // issue next (launch==1)
             cur_idx <= next_idx;
-            issue_idx_r <= next_idx;
-            core_in_valid <= 1'b1;
             issued_cnt <= issued_cnt + 5'd1;
 
             if (slot == 2'd3) begin

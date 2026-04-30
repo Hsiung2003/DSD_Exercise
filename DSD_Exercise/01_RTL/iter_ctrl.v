@@ -128,22 +128,25 @@ module iter_ctrl #(
   // Neighbors for issued idx (combinational).
   // The pipelined core samples inputs on the clock edge when `core_in_valid` is high,
   // so drive core inputs from a registered issue index.
-  reg  [3:0] issue_idx_r;
-  wire signed [15:0] bi_cur = pick_b(issue_idx_r);
-  wire signed [31:0] xim3 = pick_x($signed({1'b0,issue_idx_r}) - 3);
-  wire signed [31:0] xim2 = pick_x($signed({1'b0,issue_idx_r}) - 2);
-  wire signed [31:0] xim1 = pick_x($signed({1'b0,issue_idx_r}) - 1);
-  wire signed [31:0] xip1 = pick_x($signed({1'b0,issue_idx_r}) + 1);
-  wire signed [31:0] xip2 = pick_x($signed({1'b0,issue_idx_r}) + 2);
-  wire signed [31:0] xip3 = pick_x($signed({1'b0,issue_idx_r}) + 3);
-  
-  reg core_in_valid;
+  // Launch decision for this cycle (must be stable BEFORE posedge).
+  wire [3:0] next_idx = group + (slot << 2);
+  wire       launch   = (state == RUN) && (bubble_cnt == 2'd0) && (issued_cnt < 5'd16);
+
+  // Drive core inputs from the idx being launched this cycle.
+  wire signed [15:0] bi_cur = pick_b(next_idx);
+  wire signed [31:0] xim3 = pick_x($signed({1'b0,next_idx}) - 3);
+  wire signed [31:0] xim2 = pick_x($signed({1'b0,next_idx}) - 2);
+  wire signed [31:0] xim1 = pick_x($signed({1'b0,next_idx}) - 1);
+  wire signed [31:0] xip1 = pick_x($signed({1'b0,next_idx}) + 1);
+  wire signed [31:0] xip2 = pick_x($signed({1'b0,next_idx}) + 2);
+  wire signed [31:0] xip3 = pick_x($signed({1'b0,next_idx}) + 3);
+
+  wire core_in_valid = launch;
   wire core_out_valid;
   reg [3:0] idx_pipe0, idx_pipe1, idx_pipe2;
   reg        v_pipe0, v_pipe1, v_pipe2;
   reg [4:0] issued_cnt, commit_cnt;
   reg [1:0] bubble_cnt;
-  wire [3:0] next_idx = group + (slot << 2);
 
   // Core compute (combinational)
   wire signed [31:0] x_calc;
@@ -169,8 +172,6 @@ module iter_ctrl #(
       issued_cnt <= 5'd0;
       commit_cnt <= 5'd0;
       bubble_cnt <= 2'd0;
-      core_in_valid <= 1'b0;
-      issue_idx_r <= 4'd0;
 
       busy <= 1'b0;
       done <= 1'b0;
@@ -190,16 +191,15 @@ module iter_ctrl #(
     end else begin
       // defaults
       done <= 1'b0;
-      core_in_valid <= 1'b0;
 
       // ---- pipeline bookkeeping: shift + conditional load ----
       v_pipe2   <= v_pipe1;
       idx_pipe2 <= idx_pipe1;
       v_pipe1   <= v_pipe0;
       idx_pipe1 <= idx_pipe0;
-      if (core_in_valid) begin
+      if (launch) begin
         v_pipe0   <= 1'b1;
-        idx_pipe0 <= issue_idx_r;
+        idx_pipe0 <= next_idx;
       end else begin
         v_pipe0   <= 1'b0;
       end
@@ -246,10 +246,8 @@ module iter_ctrl #(
           busy <= 1'b1;
           if (bubble_cnt != 2'd0) begin
             bubble_cnt <= bubble_cnt - 2'd1;
-          end else if (issued_cnt < 5'd16) begin // issue next
+          end else if (issued_cnt < 5'd16) begin // issue next (launch==1)
             cur_idx <= next_idx;
-            issue_idx_r <= next_idx;
-            core_in_valid <= 1'b1;
             issued_cnt <= issued_cnt + 5'd1;
 
             if (slot == 2'd3) begin // done with current slot, core proceed next
