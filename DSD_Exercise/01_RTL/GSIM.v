@@ -25,6 +25,22 @@ reg signed [15:0] b_mem [0:15];
 reg iter_start;
 wire iter_busy, iter_done;
 wire signed [31:0] x0, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15;
+assign x0 = 32'd0;
+assign x1 = 32'd0;
+assign x2 = 32'd0;
+assign x3 = 32'd0;
+assign x4 = 32'd0;
+assign x5 = 32'd0;
+assign x6 = 32'd0;
+assign x7 = 32'd0;
+assign x8 = 32'd0;
+assign x9 = 32'd0;
+assign x10 = 32'd0;
+assign x11 = 32'd0;
+assign x12 = 32'd0;
+assign x13 = 32'd0;
+assign x14 = 32'd0;
+assign x15 = 32'd0;
 
 iter_ctrl u_iter_ctrl (
     .clk(clk),
