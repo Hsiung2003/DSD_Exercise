@@ -90,9 +90,10 @@ always @(*) begin
     case (state)
         IDLE: next_state = in_en ? READ_B : IDLE;
         READ_B: begin
-            // After the last b is captured (b_idx==15), advance to INIT_X even if
-            // host deasserts in_en immediately after sending the 16th sample.
-            if (b_idx == 4'd15) next_state = INIT_X;
+            // Only advance once we actually capture the last sample (b_idx==15 with in_en=1).
+            // This avoids accidentally latching X into b_mem[15] when the host has already
+            // deasserted in_en (and may no longer be driving b_in).
+            if (in_en && (b_idx == 4'd15)) next_state = INIT_X;
             else if (!in_en) next_state = IDLE;
             else next_state = READ_B;
         end
@@ -144,7 +145,10 @@ always @(posedge clk or posedge reset) begin
         READ_B: begin
             out_valid <= 1'b0;
             
-            if (in_en || (b_idx == 4'd15)) begin
+            // Only latch b_in when host asserts in_en.
+            // If in_en drops right after the 16th transfer, b_in can become X and would
+            // otherwise poison b_mem[15] and propagate X into the solver.
+            if (in_en) begin
                 b_mem[b_idx] <= b_in;
                 x_reg <= b_in;
                 if (b_idx != 4'd15) b_idx <= b_idx + 4'd1;
@@ -225,7 +229,7 @@ module core_xi (
   reg signed [47:0] numer_r;
   reg signed [47:0] bi_q16_r;
   // Sign-extend to wider bitwidth for safe shift-add and accumulation.
-  //wire signed [47:0] bi_q16  = {{32{bi[15]}},  bi}  <<< 16; // int -> Q16.16 in 48b
+  wire signed [47:0] bi_q16  = {{32{bi[15]}},  bi}  <<< 16; // int -> Q16.16 in 48b
   wire signed [47:0] xim3_48 = {{16{x_im3[31]}}, x_im3};
   wire signed [47:0] xim2_48 = {{16{x_im2[31]}}, x_im2};
   wire signed [47:0] xim1_48 = {{16{x_im1[31]}}, x_im1};
@@ -242,7 +246,7 @@ module core_xi (
   wire signed [47:0] wire_term_m6  = -((wire_sum_m6  <<< 1) + (wire_sum_m6  <<< 2));        // *(-6)
   wire signed [47:0] wire_term_p1  = wire_sum_p1;
 
-  wire signed [47:0] wire_numer = bi_q16 + term_p13_r + term_m6_r + term_p1_r; // Q16.16
+  wire signed [47:0] wire_numer = bi_q16_r + term_p13_r + term_m6_r + term_p1_r; // Q16.16
 
   // Exact constant divide by 20 (synthesizable in most flows).
   // Truncates toward zero (Verilog signed division behavior).
@@ -258,9 +262,9 @@ module core_xi (
       term_m6_r  <= 48'd0;
       term_p1_r  <= 48'd0;
       numer_r    <= 48'd0;
+      bi_q16_r   <= 48'd0;
       x_out <= 32'd0;
       out_valid <= 1'b0;
-      bi_q16_r <= 48'd0;
     end else begin
       // valid pipeline
       v3 <= v2;
@@ -269,7 +273,7 @@ module core_xi (
 
       // stage1: capture constant-mult terms
       if (in_valid) begin
-        bi_q16_r <= bi_q16;
+        bi_q16_r   <= bi_q16;
         term_p13_r <= wire_term_p13;
         term_m6_r  <= wire_term_m6;
         term_p1_r  <= wire_term_p1;
@@ -292,7 +296,7 @@ endmodule
 
 // Iteration controller (single-core baseline).
 module iter_ctrl #(
-  parameter integer M_ITER = 30
+  parameter integer M_ITER = 110
 ) (
   input  wire              clk,
   input  wire              reset,     // async high
@@ -364,7 +368,7 @@ module iter_ctrl #(
   reg        [15:0] updated; // 1=updated in current sweep (for new/old mux)
 
   // ---- Sweep counters ----
-  reg [5:0] iter_cnt; // 0..M_ITER-1
+  reg [15:0] iter_cnt; // 0..M_ITER-1（需 ≥ ceil(log2(M_ITER))，M_ITER>64 時 6bit 會溢位永遠等不到 done）
   reg [1:0] group;    // 0..3
   reg [1:0] slot;     // 0..3
   reg [3:0] cur_idx;  // 0..15
@@ -401,13 +405,13 @@ module iter_ctrl #(
     end
   endfunction
 
-  function automatic signed [31:0] pick_x(input integer j);
+  /*function automatic signed [31:0] pick_x(input integer j);
     begin
       if (j < 0 || j > 15) pick_x = 32'sd0;
       else if (updated[j]) pick_x = x_new[j];
       else                 pick_x = x_old[j];
     end
-  endfunction
+  endfunction*/
 
   // Pipeline/issue bookkeeping regs (declare before any wire uses them).
   reg [3:0] idx_pipe0, idx_pipe1, idx_pipe2;
@@ -430,13 +434,14 @@ module iter_ctrl #(
   wire signed [31:0] xip3 = pick_x($signed({1'b0,next_idx}) + 3);*/
   wire signed [15:0] bi_cur = pick_b(next_idx);
   // Verilog-2001 friendly index arithmetic (no SystemVerilog casts).
-  wire signed [5:0] next_idx_s = {2'b00, next_idx}; // 0..15 in signed 6b
+  /*wire signed [5:0] next_idx_s = {2'b00, next_idx}; // 0..15 in signed 6b
   wire signed [31:0] xim3 = pick_x(next_idx_s - 6'd3);
   wire signed [31:0] xim2 = pick_x(next_idx_s - 6'd2);
   wire signed [31:0] xim1 = pick_x(next_idx_s - 6'd1);
   wire signed [31:0] xip1 = pick_x(next_idx_s + 6'd1);
   wire signed [31:0] xip2 = pick_x(next_idx_s + 6'd2);
-  wire signed [31:0] xip3 = pick_x(next_idx_s + 6'd3);
+  wire signed [31:0] xip3 = pick_x(next_idx_s + 6'd3);*/
+  reg signed [31:0] xim3, xim2, xim1, xip1, xip2, xip3;
   wire core_in_valid = launch;
   wire core_out_valid;
 
@@ -455,7 +460,56 @@ module iter_ctrl #(
     .x_ip3(xip3),
     .x_out(x_calc)
   );
+  //取代原本function pick_x的部分，因為裡面用到input integer j，不可靠會回傳X，造成資料汙染
+  always @(*) begin
+    // xim3 = x[idx-3] (old or new)
+    if (next_idx < 4'd3)
+        xim3 = 32'sd0;
+    else if (updated[next_idx - 4'd3])
+        xim3 = x_new[next_idx - 4'd3];
+    else
+        xim3 = x_old[next_idx - 4'd3];
 
+    // xim2 = x[idx-2]
+    if (next_idx < 4'd2)
+        xim2 = 32'sd0;
+    else if (updated[next_idx - 4'd2])
+        xim2 = x_new[next_idx - 4'd2];
+    else
+        xim2 = x_old[next_idx - 4'd2];
+
+    // xim1 = x[idx-1]
+    if (next_idx < 4'd1)
+        xim1 = 32'sd0;
+    else if (updated[next_idx - 4'd1])
+        xim1 = x_new[next_idx - 4'd1];
+    else
+        xim1 = x_old[next_idx - 4'd1];
+
+    // xip1 = x[idx+1]
+    if (next_idx > 4'd14)
+        xip1 = 32'sd0;
+    else if (updated[next_idx + 4'd1])
+        xip1 = x_new[next_idx + 4'd1];
+    else
+        xip1 = x_old[next_idx + 4'd1];
+
+    // xip2 = x[idx+2]
+    if (next_idx > 4'd13)
+        xip2 = 32'sd0;
+    else if (updated[next_idx + 4'd2])
+        xip2 = x_new[next_idx + 4'd2];
+    else
+        xip2 = x_old[next_idx + 4'd2];
+
+    // xip3 = x[idx+3]
+    if (next_idx > 4'd12)
+        xip3 = 32'sd0;
+    else if (updated[next_idx + 4'd3])
+        xip3 = x_new[next_idx + 4'd3];
+    else
+        xip3 = x_old[next_idx + 4'd3];
+  end
   integer k;
   always @(posedge clk or posedge reset) begin
     if (reset) begin
@@ -468,7 +522,7 @@ module iter_ctrl #(
 
       busy <= 1'b0;
       done <= 1'b0;
-      iter_cnt <= 6'd0;
+      iter_cnt <= 16'd0;
       group <= 2'd0;
       slot <= 2'd0;
       cur_idx <= 4'd0;
@@ -496,7 +550,10 @@ module iter_ctrl #(
       end else begin
         v_pipe0   <= 1'b0;
       end
-      if (core_out_valid && v_pipe2) begin
+      // Only commit core results during RUN. This prevents stray tail commits
+      // from the previous sweep/iteration from corrupting x_new while INIT is
+      // re-initializing x_old/x_new and clearing `updated`.
+      if ((state == RUN) && core_out_valid && v_pipe2) begin
         x_new[idx_pipe2] <= x_calc;
         updated[idx_pipe2] <= 1'b1;
         commit_cnt <= commit_cnt + 5'd1;
@@ -510,15 +567,17 @@ module iter_ctrl #(
             issued_cnt <= 5'd0;
             commit_cnt <= 5'd0;
             bubble_cnt <= 2'd0;
-            iter_cnt <= 6'd0;
+            iter_cnt <= 16'd0;
           end
         end
         INIT: begin
           busy <= 1'b1;
           for (k = 0; k < 16; k = k + 1) begin
-            if (iter_cnt == 6'd0) begin
-              x_old[k] <= x_init[k];
-              x_new[k] <= x_init[k];
+            if (iter_cnt == 16'd0) begin
+              x_old[k] <= 32'd0;
+              //x_new[k] <= x_init[k];
+              //x_old[k] <= 32'd0;
+              x_new[k] <= 32'd0;
             end else begin
               x_old[k] <= x_new[k];
             end
@@ -560,7 +619,7 @@ module iter_ctrl #(
             if (iter_cnt == M_ITER-1) begin
               state <= DONE;
             end else begin
-              iter_cnt <= iter_cnt + 6'd1;
+              iter_cnt <= iter_cnt + 16'd1;
               state <= INIT;
             end
           end
