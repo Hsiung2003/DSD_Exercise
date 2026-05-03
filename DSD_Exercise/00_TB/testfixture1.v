@@ -83,34 +83,6 @@ initial begin
     in_en = 1'b0;  b_in=16'hz;
 end
 
-// -----------------------------------------------------------------------------
-// Debug prints (hierarchical references into DUT)
-// -----------------------------------------------------------------------------
-always @(posedge clk) begin
-   // When DUT kicks off iterations, dump captured b_mem[0..15]
-   if (GSIM.iter_start) begin
-      $display("\n[DBG] iter_start @%0t state=%0d b_idx=%0d in_en=%b",
-               $time, GSIM.state, GSIM.b_idx, GSIM.in_en);
-      $display("[DBG] b_mem = %0d %0d %0d %0d %0d %0d %0d %0d %0d %0d %0d %0d %0d %0d %0d %0d",
-               $signed(GSIM.b_mem0_dbg),  $signed(GSIM.b_mem1_dbg),  $signed(GSIM.b_mem2_dbg),  $signed(GSIM.b_mem3_dbg),
-               $signed(GSIM.b_mem4_dbg),  $signed(GSIM.b_mem5_dbg),  $signed(GSIM.b_mem6_dbg),  $signed(GSIM.b_mem7_dbg),
-               $signed(GSIM.b_mem8_dbg),  $signed(GSIM.b_mem9_dbg),  $signed(GSIM.b_mem10_dbg), $signed(GSIM.b_mem11_dbg),
-               $signed(GSIM.b_mem12_dbg), $signed(GSIM.b_mem13_dbg), $signed(GSIM.b_mem14_dbg), $signed(GSIM.b_mem15_dbg));
-   end
-
-   // When iter_ctrl finishes, dump x0..x15 and some internal status
-   if (GSIM.iter_done) begin
-      $display("\n[DBG] iter_done @%0t commit_cnt=%0d issued_cnt=%0d",
-               $time, GSIM.u_iter_ctrl.commit_cnt, GSIM.u_iter_ctrl.issued_cnt);
-      $display("[DBG] last x_calc=%h core_out_valid=%b v_pipe2=%b idx_pipe2=%0d",
-               GSIM.u_iter_ctrl.x_calc, GSIM.u_iter_ctrl.core_out_valid, GSIM.u_iter_ctrl.v_pipe2, GSIM.u_iter_ctrl.idx_pipe2);
-      $display("[DBG] x0..x15 (raw Q16.16 hex): %h %h %h %h %h %h %h %h %h %h %h %h %h %h %h %h",
-               GSIM.x0, GSIM.x1, GSIM.x2, GSIM.x3, GSIM.x4, GSIM.x5, GSIM.x6, GSIM.x7,
-               GSIM.x8, GSIM.x9, GSIM.x10, GSIM.x11, GSIM.x12, GSIM.x13, GSIM.x14, GSIM.x15);
-   end
-end
-
-
 always @(negedge clk)begin
    if(loop <16)begin
       if(out_valid)begin

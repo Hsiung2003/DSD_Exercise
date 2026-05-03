@@ -35,7 +35,7 @@ set hdlin_translate_off_skip_text "TRUE"
 set edifout_netlist_only "TRUE"
 set verilogout_no_tri true
 
-analyze -format verilog "../01_RTL/GSIM.v"
+analyze -format verilog [list "../01_RTL/core_xi.v" "../01_RTL/GSIM.v"]
 elaborate $DESIGN
 link
 

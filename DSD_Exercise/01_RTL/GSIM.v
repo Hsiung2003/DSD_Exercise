@@ -7,11 +7,14 @@ output  reg out_valid;
 input   [15:0]  b_in;
 output  reg [31:0]  x_out;
 /*------Parameter------*/
+localparam integer M_ITER = 80; // 與下方 iter_ctrl 的 parameter 預設一致；改迭代次數時請一併改 iter_ctrl 例化
+localparam integer TOTAL = M_ITER * 16;
 localparam IDLE = 3'd0;
 localparam READ_B = 3'd1;    // in_en=1, 讀進 b_in, 存b[0]~b[15]
 localparam INIT_X = 3'd2;    // X的初始值
 localparam ITERATE = 3'd3;   // 做 M 次 Gauss-Seidel
 localparam WRITE_OUT = 3'd4; // out_valid=1, 依序輸出x[0]~x[15]
+
 // Iterations are handled inside iter_ctrl
 
 /*------Wires and Registers------*/
@@ -20,6 +23,10 @@ reg [15:0] x_reg;
 reg [3:0] out_idx;
 reg [3:0] b_idx;
 reg signed [15:0] b_mem [0:15];
+//reg signed [31:0] x_mem [0:15];
+reg [10:0] total_issued;
+reg [10:0] total_commit;
+
 
 // ---- debug taps: expose b_mem as normal wires (Verilog-2001 friendly) ----
 wire signed [15:0] b_mem0_dbg;
@@ -64,11 +71,12 @@ wire iter_start;
 wire iter_busy, iter_done;
 wire signed [31:0] x0, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15;
 
-// Robust start pulse: hold start HIGH for the whole INIT_X cycle so iter_ctrl
-// (which samples on posedge) will not miss it.
-assign iter_start = (state == INIT_X);
+// iter_start：在 ITERATE 狀態維持為 1，讓 iter_ctrl 能看見 start（依 iter_ctrl 內邏輯可再改成脈波）
+assign iter_start = (state == READ_B) && in_en && (b_idx == 4'd15);
 
-iter_ctrl u_iter_ctrl (
+iter_ctrl #(
+    .M_ITER(M_ITER)
+) u_iter_ctrl (
     .clk(clk),
     .reset(reset),
     .start(iter_start),
@@ -248,9 +256,12 @@ module core_xi (
 
   wire signed [47:0] wire_numer = bi_q16_r + term_p13_r + term_m6_r + term_p1_r; // Q16.16
 
-  // Exact constant divide by 20 (synthesizable in most flows).
-  // Truncates toward zero (Verilog signed division behavior).
-  wire signed [47:0] wire_div20 = numer_r / 48'sd20;
+  // Exact divide by 20, rewritten as (/4) then (/5).
+  // This is bit-exact for signed truncation-toward-zero division and often synthesizes smaller:
+  // - /4 can become a cheap shift with sign handling
+  // - /5 constant division is simpler than /20 in some libraries/tools
+  wire signed [47:0] numer_div4 = numer_r / 48'sd4;
+  wire signed [47:0] wire_div20 = numer_div4 / 48'sd5;
 
 //pipeline
   always @(posedge clk or posedge reset) begin
@@ -296,7 +307,7 @@ endmodule
 
 // Iteration controller (single-core baseline).
 module iter_ctrl #(
-  parameter integer M_ITER = 110
+  parameter integer M_ITER = 80
 ) (
   input  wire              clk,
   input  wire              reset,     // async high
@@ -342,31 +353,8 @@ module iter_ctrl #(
   output reg signed [31:0] x15
 );
 
-  // ---- Initial guess x^(0) (Q16.16) ----
-  // Edit the assigns below to set each x[i] initial value.
-  wire signed [31:0] x_init [0:15];
-  assign x_init[0]  = 32'd0;
-  assign x_init[1]  = 32'd0;
-  assign x_init[2]  = 32'd0;
-  assign x_init[3]  = 32'd0;
-  assign x_init[4]  = 32'd0;
-  assign x_init[5]  = 32'd0;
-  assign x_init[6]  = 32'd0;
-  assign x_init[7]  = 32'd0;
-  assign x_init[8]  = 32'd0;
-  assign x_init[9]  = 32'd0;
-  assign x_init[10] = 32'd0;
-  assign x_init[11] = 32'd0;
-  assign x_init[12] = 32'd0;
-  assign x_init[13] = 32'd0;
-  assign x_init[14] = 32'd0;
-  assign x_init[15] = 32'd0;
-
-  // ---- Internal storage ----
-  reg signed [31:0] x_old [0:15];
-  reg signed [31:0] x_new [0:15];
-  reg        [15:0] updated; // 1=updated in current sweep (for new/old mux)
-
+  //Internal storage
+  reg signed [31:0] x_mem [0:15];
   // ---- Sweep counters ----
   reg [15:0] iter_cnt; // 0..M_ITER-1（需 ≥ ceil(log2(M_ITER))，M_ITER>64 時 6bit 會溢位永遠等不到 done）
   reg [1:0] group;    // 0..3
@@ -379,7 +367,11 @@ module iter_ctrl #(
     INIT = 2'b01,
     RUN = 2'b10,
     DONE = 2'b11;
+  localparam integer TOTAL = M_ITER * 16;
   reg [1:0] state;
+  reg [10:0] total_issued;     
+  reg [10:0] total_commit; 
+  // single-core: done pulses directly in DONE state
 
   // ---- Helpers ----
   function automatic signed [15:0] pick_b(input [3:0] idx);
@@ -405,46 +397,23 @@ module iter_ctrl #(
     end
   endfunction
 
-  /*function automatic signed [31:0] pick_x(input integer j);
-    begin
-      if (j < 0 || j > 15) pick_x = 32'sd0;
-      else if (updated[j]) pick_x = x_new[j];
-      else                 pick_x = x_old[j];
-    end
-  endfunction*/
+  // ---------------------------------------------------------------------------
+  // Single-core issue (A-ranked reference): launch one index per cycle using
+  // the proven order 0,4,8,12,1,5,9,13,2,6,10,14,3,7,11,15 (next_idx={slot,group}).
+  // ---------------------------------------------------------------------------
 
-  // Pipeline/issue bookkeeping regs (declare before any wire uses them).
+  // Pipeline/issue bookkeeping regs.
   reg [3:0] idx_pipe0, idx_pipe1, idx_pipe2;
   reg        v_pipe0, v_pipe1, v_pipe2;
-  reg [4:0] issued_cnt, commit_cnt;
-  reg [1:0] bubble_cnt;
 
   // Launch decision for this cycle (must be stable BEFORE posedge).
-  //wire [3:0] next_idx = group + (slot << 2);
   wire [3:0] next_idx = {slot, group};
-  wire       launch   = (state == RUN) && (bubble_cnt == 2'd0) && (issued_cnt < 5'd16);
-
-  // Drive core inputs from the idx being launched this cycle.
-  /*wire signed [15:0] bi_cur = pick_b(next_idx);
-  wire signed [31:0] xim3 = pick_x($signed({1'b0,next_idx}) - 3);
-  wire signed [31:0] xim2 = pick_x($signed({1'b0,next_idx}) - 2);
-  wire signed [31:0] xim1 = pick_x($signed({1'b0,next_idx}) - 1);
-  wire signed [31:0] xip1 = pick_x($signed({1'b0,next_idx}) + 1);
-  wire signed [31:0] xip2 = pick_x($signed({1'b0,next_idx}) + 2);
-  wire signed [31:0] xip3 = pick_x($signed({1'b0,next_idx}) + 3);*/
+  wire       launch   = (state == RUN) && (total_issued < TOTAL);
+  // Core inputs (idx = next_idx)
   wire signed [15:0] bi_cur = pick_b(next_idx);
-  // Verilog-2001 friendly index arithmetic (no SystemVerilog casts).
-  /*wire signed [5:0] next_idx_s = {2'b00, next_idx}; // 0..15 in signed 6b
-  wire signed [31:0] xim3 = pick_x(next_idx_s - 6'd3);
-  wire signed [31:0] xim2 = pick_x(next_idx_s - 6'd2);
-  wire signed [31:0] xim1 = pick_x(next_idx_s - 6'd1);
-  wire signed [31:0] xip1 = pick_x(next_idx_s + 6'd1);
-  wire signed [31:0] xip2 = pick_x(next_idx_s + 6'd2);
-  wire signed [31:0] xip3 = pick_x(next_idx_s + 6'd3);*/
   reg signed [31:0] xim3, xim2, xim1, xip1, xip2, xip3;
-  wire core_in_valid = launch;
-  wire core_out_valid;
-
+  wire              core_in_valid  = launch;
+  wire              core_out_valid;
   wire signed [31:0] x_calc;
   core_xi u_core (
     .clk    (clk),
@@ -460,76 +429,30 @@ module iter_ctrl #(
     .x_ip3(xip3),
     .x_out(x_calc)
   );
-  //取代原本function pick_x的部分，因為裡面用到input integer j，不可靠會回傳X，造成資料汙染
+
+  // Neighbor pick using updated/x_new vs x_old (avoid integer index).
   always @(*) begin
-    // xim3 = x[idx-3] (old or new)
-    if (next_idx < 4'd3)
-        xim3 = 32'sd0;
-    else if (updated[next_idx - 4'd3])
-        xim3 = x_new[next_idx - 4'd3];
-    else
-        xim3 = x_old[next_idx - 4'd3];
-
-    // xim2 = x[idx-2]
-    if (next_idx < 4'd2)
-        xim2 = 32'sd0;
-    else if (updated[next_idx - 4'd2])
-        xim2 = x_new[next_idx - 4'd2];
-    else
-        xim2 = x_old[next_idx - 4'd2];
-
-    // xim1 = x[idx-1]
-    if (next_idx < 4'd1)
-        xim1 = 32'sd0;
-    else if (updated[next_idx - 4'd1])
-        xim1 = x_new[next_idx - 4'd1];
-    else
-        xim1 = x_old[next_idx - 4'd1];
-
-    // xip1 = x[idx+1]
-    if (next_idx > 4'd14)
-        xip1 = 32'sd0;
-    else if (updated[next_idx + 4'd1])
-        xip1 = x_new[next_idx + 4'd1];
-    else
-        xip1 = x_old[next_idx + 4'd1];
-
-    // xip2 = x[idx+2]
-    if (next_idx > 4'd13)
-        xip2 = 32'sd0;
-    else if (updated[next_idx + 4'd2])
-        xip2 = x_new[next_idx + 4'd2];
-    else
-        xip2 = x_old[next_idx + 4'd2];
-
-    // xip3 = x[idx+3]
-    if (next_idx > 4'd12)
-        xip3 = 32'sd0;
-    else if (updated[next_idx + 4'd3])
-        xip3 = x_new[next_idx + 4'd3];
-    else
-        xip3 = x_old[next_idx + 4'd3];
-  end
+    xim3 = (next_idx < 4'd3)  ? 32'sd0 : x_mem[next_idx-4'd3];
+    xim2 = (next_idx < 4'd2)  ? 32'sd0 : x_mem[next_idx-4'd2];
+    xim1 = (next_idx < 4'd1)  ? 32'sd0 : x_mem[next_idx-4'd1];
+    xip1 = (next_idx > 4'd14) ? 32'sd0 : x_mem[next_idx+4'd1];
+    xip2 = (next_idx > 4'd13) ? 32'sd0 : x_mem[next_idx+4'd2];
+    xip3 = (next_idx > 4'd12) ? 32'sd0 : x_mem[next_idx+4'd3];
+end
   integer k;
   always @(posedge clk or posedge reset) begin
     if (reset) begin
       state <= IDLE;
-      issued_cnt <= 5'd0;
-      commit_cnt <= 5'd0;
-      bubble_cnt <= 2'd0;
       v_pipe0 <= 1'b0; v_pipe1 <= 1'b0; v_pipe2 <= 1'b0;
       idx_pipe0 <= 4'd0; idx_pipe1 <= 4'd0; idx_pipe2 <= 4'd0;
-
       busy <= 1'b0;
       done <= 1'b0;
-      iter_cnt <= 16'd0;
+      total_issued <= 11'd0;
+      total_commit <= 11'd0;
       group <= 2'd0;
       slot <= 2'd0;
-      cur_idx <= 4'd0;
-      updated <= 16'd0;
       for (k = 0; k < 16; k = k + 1) begin
-        x_old[k] <= 32'sd0;
-        x_new[k] <= 32'sd0;
+        x_mem[k] <= 32'd0;
       end
       x0 <= 32'sd0;  x1 <= 32'sd0;  x2 <= 32'sd0;  x3 <= 32'sd0;
       x4 <= 32'sd0;  x5 <= 32'sd0;  x6 <= 32'sd0;  x7 <= 32'sd0;
@@ -550,89 +473,44 @@ module iter_ctrl #(
       end else begin
         v_pipe0   <= 1'b0;
       end
-      // Only commit core results during RUN. This prevents stray tail commits
-      // from the previous sweep/iteration from corrupting x_new while INIT is
-      // re-initializing x_old/x_new and clearing `updated`.
       if ((state == RUN) && core_out_valid && v_pipe2) begin
-        x_new[idx_pipe2] <= x_calc;
-        updated[idx_pipe2] <= 1'b1;
-        commit_cnt <= commit_cnt + 5'd1;
+        x_mem[idx_pipe2] <= x_calc;
+        total_commit <= total_commit + 11'd1;
       end
 
       case (state)
         IDLE: begin
           busy <= 1'b0;
           if (start) begin
-            state <= INIT;
-            issued_cnt <= 5'd0;
-            commit_cnt <= 5'd0;
-            bubble_cnt <= 2'd0;
-            iter_cnt <= 16'd0;
+            state <= RUN;
+            total_issued <= 11'd0;
+            total_commit <= 11'd0;
           end
         end
-        INIT: begin
-          busy <= 1'b1;
-          for (k = 0; k < 16; k = k + 1) begin
-            if (iter_cnt == 16'd0) begin
-              x_old[k] <= 32'd0;
-              //x_new[k] <= x_init[k];
-              //x_old[k] <= 32'd0;
-              x_new[k] <= 32'd0;
-            end else begin
-              x_old[k] <= x_new[k];
-            end
-          end
-          updated <= 16'd0;
-          issued_cnt <= 5'd0;
-          commit_cnt <= 5'd0;
-          bubble_cnt <= 2'd0;
-          group <= 2'd0;
-          slot <= 2'd0;
-          v_pipe0 <= 1'b0;
-          v_pipe1 <= 1'b0;
-          v_pipe2 <= 1'b0;
-          state <= RUN;
-        end
-
         RUN: begin 
           busy <= 1'b1;
-          if (bubble_cnt != 2'd0) begin
-            bubble_cnt <= bubble_cnt - 2'd1;
-          end else if (issued_cnt < 5'd16) begin // issue next (launch==1)
-            cur_idx <= next_idx;
-            issued_cnt <= issued_cnt + 5'd1;
-
-            if (slot == 2'd3) begin
+          if (launch) begin
+            total_issued <= total_issued + 11'd1;
+            if(slot == 2'd3) begin
               slot <= 2'd0;
-              if (group == 2'd3) begin
-                group <= 2'd0;
-              end else begin
-                group <= group + 2'd1;
-                bubble_cnt <= 2'd2;
-              end 
-            end else begin
-              slot <= slot + 2'd1;
+              group <= (group == 2'd3) ? 2'd0 : group + 2'd1;
             end 
-          end
-
-          if (commit_cnt == 5'd16 ) begin
-            if (iter_cnt == M_ITER-1) begin
-              state <= DONE;
-            end else begin
-              iter_cnt <= iter_cnt + 16'd1;
-              state <= INIT;
+            else begin
+              slot <= slot +2'd1;
             end
           end
+          if(total_commit == TOTAL) begin
+            state <= DONE;
+          end
         end
-
         DONE: begin
-          state <= IDLE;
-          x0  <= x_new[0];  x1  <= x_new[1];  x2  <= x_new[2];  x3  <= x_new[3];
-          x4  <= x_new[4];  x5  <= x_new[5];  x6  <= x_new[6];  x7  <= x_new[7];
-          x8  <= x_new[8];  x9  <= x_new[9];  x10 <= x_new[10]; x11 <= x_new[11];
-          x12 <= x_new[12]; x13 <= x_new[13]; x14 <= x_new[14]; x15 <= x_new[15];
-          busy <= 1'b0;
-          done <= 1'b1;
+            state <= IDLE;
+            x0  <= x_mem[0];   x1  <= x_mem[1];   x2  <= x_mem[2];   x3  <= x_mem[3];
+            x4  <= x_mem[4];   x5  <= x_mem[5];   x6  <= x_mem[6];   x7  <= x_mem[7];
+            x8  <= x_mem[8];   x9  <= x_mem[9];   x10 <= x_mem[10];  x11 <= x_mem[11];
+            x12 <= x_mem[12];  x13 <= x_mem[13];  x14 <= x_mem[14];  x15 <= x_mem[15];
+            busy <= 1'b0;
+            done <= 1'b1;
         end
         default: state <= IDLE;
       endcase
